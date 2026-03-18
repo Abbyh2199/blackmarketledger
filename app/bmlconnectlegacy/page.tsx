@@ -92,7 +92,7 @@ export default function BMLDashboard() {
   const [showMigrationDialog, setShowMigrationDialog] = useState(false);
   const [bypassExtension, setBypassExtension] = useState(false);
   const [pendingStorageSwitch, setPendingStorageSwitch] = useState<{
-    target: "browser" | "drive";
+    target: StorageLocation;
     label: string;
   } | null>(null);
   const [migrationCounts, setMigrationCounts] = useState<{
@@ -148,31 +148,40 @@ export default function BMLDashboard() {
     return response;
   };
 
-  const initiateStorageSwitch = async (target: "browser" | "drive", label: string) => {
+  const initiateStorageSwitch = async (target: StorageLocation, label: string) => {
     if (storageLocation === target) return;
-    
-    // Fetch counts before showing dialog
-    const sourceDB = target === 'drive' ? 'LogsDB' : 'GoogleCacheLogsDB';
-    const targetDB = target === 'drive' ? 'GoogleCacheLogsDB' : 'LogsDB';
-    
+
+    const readTxnsFor = async (loc: StorageLocation) => {
+      try {
+        if (loc === 'extension') {
+          const res = await sendToExtension<Transaction[]>({ type: 'EXTENSION_DB_LOAD' });
+          if (res && res.success && Array.isArray(res.data)) return res.data as Transaction[];
+          return [] as Transaction[];
+        }
+        if (loc === 'drive') return await idb.getAllTransactions('GoogleCacheLogsDB');
+        return await idb.getAllTransactions('LogsDB');
+      } catch (e) {
+        console.error(`Failed to read transactions for ${loc}`, e);
+        return [] as Transaction[];
+      }
+    };
+
     setIsMigrating(true);
     try {
-      const sourceData = await idb.getAllTransactions(sourceDB);
-      const targetData = await idb.getAllTransactions(targetDB);
-      
+      const sourceData = await readTxnsFor(storageLocation);
+      const targetData = await readTxnsFor(target);
+
       // Calculate merge count
       const ids = new Set(targetData.map((t: any) => t.id));
       let mergeCount = targetData.length;
       sourceData.forEach((t: any) => {
-        if (!ids.has(t.id)) {
-          mergeCount++;
-        }
+        if (!ids.has(t.id)) mergeCount++;
       });
 
       setMigrationCounts({
         source: sourceData.length,
         target: targetData.length,
-        merge: mergeCount
+        merge: mergeCount,
       });
       setPendingStorageSwitch({ target, label });
       setShowMigrationDialog(true);
@@ -189,13 +198,89 @@ export default function BMLDashboard() {
     setIsMigrating(true);
     vibrate("utility");
     try {
-      await switchStorageLocation(pendingStorageSwitch.target, type);
-      setStorageLocation(pendingStorageSwitch.target);
+      const target = pendingStorageSwitch.target;
+      const source = storageLocation;
+
+      const readTxnsFor = async (loc: StorageLocation) => {
+        try {
+          if (loc === 'extension') {
+            const res = await sendToExtension<Transaction[]>({ type: 'EXTENSION_DB_LOAD' });
+            if (res && res.success && Array.isArray(res.data)) return res.data as Transaction[];
+            return [] as Transaction[];
+          }
+          if (loc === 'drive') return await idb.getAllTransactions('GoogleCacheLogsDB');
+          return await idb.getAllTransactions('LogsDB');
+        } catch (e) {
+          console.error(`Failed to read transactions for ${loc}`, e);
+          return [] as Transaction[];
+        }
+      };
+
+      // If target is the extension, push data into the extension storage
+      if (target === 'extension') {
+        if (type !== 'none') {
+          const sourceData = await readTxnsFor(source);
+          if (type === 'overwrite') {
+            await sendToExtension({ type: 'EXTENSION_DB_SAVE', payload: { logs: sourceData } });
+          } else if (type === 'merge') {
+            const existing = await readTxnsFor('extension');
+            const ids = new Set(existing.map((t: any) => t.id));
+            const merged = [...existing];
+            sourceData.forEach((t: any) => { if (!ids.has(t.id)) merged.push(t); });
+            merged.sort((a: any, b: any) => a.date - b.date);
+            await sendToExtension({ type: 'EXTENSION_DB_SAVE', payload: { logs: merged } });
+          }
+        }
+
+        localStorage.setItem('bml_storage_pref', 'extension');
+        setStorageLocation('extension');
+        setShowMigrationDialog(false);
+        setPendingStorageSwitch(null);
+        setMigrationCounts(null);
+        setMigrationComplete(true);
+        vibrate('success');
+        window.setTimeout(() => setMigrationComplete(false), 3000);
+        window.location.reload();
+        return;
+      }
+
+      // If source is extension -> move from extension into target DB
+      if (source === 'extension' && (target === 'drive' || target === 'browser')) {
+        const extData = await readTxnsFor('extension');
+        const targetDB = target === 'drive' ? 'GoogleCacheLogsDB' : 'LogsDB';
+
+        if (type === 'overwrite') {
+          await idb.saveTransactions(targetDB, extData);
+          if (target === 'drive' && driveApiKey) await writeGoogleDriveData(driveApiKey, extData);
+        } else if (type === 'merge') {
+          const existing = await idb.getAllTransactions(targetDB);
+          const ids = new Set(existing.map((t: any) => t.id));
+          const merged = [...existing];
+          extData.forEach((t: any) => { if (!ids.has(t.id)) merged.push(t); });
+          merged.sort((a: any, b: any) => a.date - b.date);
+          await idb.saveTransactions(targetDB, merged);
+          if (target === 'drive' && driveApiKey) await writeGoogleDriveData(driveApiKey, merged);
+        }
+
+        await switchStorageLocation(target === 'drive' ? 'drive' : 'browser', 'none');
+        setStorageLocation(target);
+        setShowMigrationDialog(false);
+        setPendingStorageSwitch(null);
+        setMigrationCounts(null);
+        setMigrationComplete(true);
+        vibrate('success');
+        window.setTimeout(() => setMigrationComplete(false), 3000);
+        return;
+      }
+
+      // Default: use existing switchStorageLocation for browser <-> drive
+      await switchStorageLocation(target === 'drive' ? 'drive' : 'browser', type);
+      setStorageLocation(target);
       setShowMigrationDialog(false);
       setPendingStorageSwitch(null);
       setMigrationCounts(null);
       setMigrationComplete(true);
-      vibrate("success");
+      vibrate('success');
       window.setTimeout(() => setMigrationComplete(false), 3000);
     } catch (error) {
       console.error("Migration failed", error);
